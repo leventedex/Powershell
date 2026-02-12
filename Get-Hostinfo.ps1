@@ -1,5 +1,5 @@
 # ----------------------------------------------------------
-# System Inventory Script (with SMB Shares + TXT Export)
+# System Inventory Script (NO SMB Shares) + TXT Export
 # Windows Server 2012 R2 compatible
 # ----------------------------------------------------------
 
@@ -28,14 +28,32 @@ catch {
 }
 $IPAddresses = ($ipList | Sort-Object -Unique) -join ", "
 
-# --- OS Name & Version (WMI, as requested) ---
-$OS = Get-WmiObject Win32_OperatingSystem
-$OSName = $OS.Caption
+# --- OS Name & Version ---
+$OS        = Get-WmiObject Win32_OperatingSystem
+$OSName    = $OS.Caption
 $OSVersion = $OS.Version
 
-# --- Storage (FileSystem Drives) ---
-$Drives = Get-PSDrive -PSProvider FileSystem |
-    Select-Object Name, Root, Used, Free
+# --- PowerShell Version ---
+$PSVersion = $PSVersionTable.PSVersion.ToString()
+
+# --- Storage (Drives with Capacity via WMI) ---
+$logicalDisks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+
+$driveInfo = foreach ($ld in $logicalDisks) {
+    $sizeGB = if ($ld.Size) { [math]::Round(($ld.Size -as [double]) / 1GB, 2) } else { $null }
+    $freeGB = if ($ld.FreeSpace) { [math]::Round(($ld.FreeSpace -as [double]) / 1GB, 2) } else { $null }
+    $usedGB = if ($sizeGB -ne $null -and $freeGB -ne $null) { [math]::Round($sizeGB - $freeGB, 2) } else { $null }
+
+    [pscustomobject]@{
+        Name        = $ld.DeviceID.TrimEnd(':')
+        Root        = "$($ld.DeviceID)\"
+        CapacityGB  = $sizeGB
+        UsedGB      = $usedGB
+        FreeGB      = $freeGB
+        FileSystem  = $ld.FileSystem
+        VolumeName  = $ld.VolumeName
+    }
+}
 
 # --- RAM (GB) ---
 $RAM_GB = [math]::Round((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
@@ -44,24 +62,17 @@ $RAM_GB = [math]::Round((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory
 $CPU = Get-WmiObject Win32_Processor |
     Select-Object -First 1 Name, NumberOfCores, NumberOfLogicalProcessors
 
-# --- SMB Shares ---
-try {
-    $SMBShares = Get-SmbShare | Select-Object Name, Path, Description, ScopeName, ShareState
-}
-catch {
-    $SMBShares = "SMB Share information unavailable."
-}
-
-# --- Build summary object (for quick view / potential export) ---
+# --- Build summary object ---
 $SystemInfo = [PSCustomObject]@{
-    HostFQDN   = $FQDN
-    IPAddress  = $IPAddresses
-    OSName     = $OSName
-    OSVersion  = $OSVersion
-    RAM_GB     = $RAM_GB
-    CPUName    = $CPU.Name
-    Cores      = $CPU.NumberOfCores
-    LogicalCPU = $CPU.NumberOfLogicalProcessors
+    HostFQDN      = $FQDN
+    IPAddress     = $IPAddresses
+    OSName        = $OSName
+    OSVersion     = $OSVersion
+    PSVersion     = $PSVersion
+    RAM_GB        = $RAM_GB
+    CPUName       = $CPU.Name
+    Cores         = $CPU.NumberOfCores
+    LogicalCPU    = $CPU.NumberOfLogicalProcessors
 }
 
 # --- Console Output ---
@@ -71,50 +82,47 @@ $SystemInfo | Format-List
 
 Write-Host ""
 Write-Host "===== FILE SYSTEM DRIVES =====" -ForegroundColor Green
-$Drives |
-    Select-Object Name, Root,
-        @{n='Used(GB)';e={[math]::Round($_.Used/1GB,2)}},
-        @{n='Free(GB)';e={[math]::Round($_.Free/1GB,2)}} |
+$driveInfo |
+    Select-Object `
+        @{n='Drive';e={$_.Name}},
+        @{n='Root';e={$_.Root}},
+        @{n='Capacity(GB)';e={$_.CapacityGB}},
+        @{n='Used(GB)';e={$_.UsedGB}},
+        @{n='Free(GB)';e={$_.FreeGB}},
+        @{n='FS';e={$_.FileSystem}},
+        @{n='Label';e={$_.VolumeName}} |
+    Sort-Object Drive |
     Format-Table -AutoSize
 
-Write-Host ""
-Write-Host "===== SMB SHARES =====" -ForegroundColor Green
-if ($SMBShares -is [string]) {
-    Write-Host $SMBShares -ForegroundColor Yellow
-}
-else {
-    $SMBShares | Format-Table Name, Path, Description, ScopeName, ShareState -AutoSize
-}
-
 # ----------------------------------------------------------
-# TXT EXPORT (Prompt for path+name; default if empty)
+# TXT EXPORT
 # ----------------------------------------------------------
 
 $exportTXT = Read-Host "Do you want to export the results to a TXT file? (Y/N)"
 
 if ($exportTXT -match '^(Y|y)$') {
 
-    $timestamp = (Get-Date).ToString('yyyy-MM-dd_HH-mm-ss')
-    $defaultName = "$env:COMPUTERNAME" + "_" + $timestamp + ".txt"
-    $defaultPath = "C:\Temp\$defaultName"
+    $timestamp    = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    $defaultDir   = 'C:\Temp'
+    $defaultName  = "{0}_SystemInventory_{1}.txt" -f $env:COMPUTERNAME, $timestamp
+    $defaultPath  = Join-Path -Path $defaultDir -ChildPath $defaultName
 
     Write-Host "Enter the full path and filename for the TXT export." -ForegroundColor Cyan
     $userPath = Read-Host "Press ENTER to use default:`n$defaultPath"
 
-    if ([string]::IsNullOrWhiteSpace($userPath)) {
-        $filepath = $defaultPath
-    }
-    else {
-        $filepath = $userPath
+    $filepath = if ([string]::IsNullOrWhiteSpace($userPath)) { $defaultPath } else { $userPath }
+
+    if (-not ($filepath.ToLower().EndsWith('.txt'))) {
+        $filepath = "$filepath.txt"
     }
 
     # Create directory if missing
-    $folder = Split-Path $filepath
+    $folder = Split-Path $filepath -Parent
     if (!(Test-Path $folder)) {
         New-Item -ItemType Directory -Path $folder -Force | Out-Null
     }
 
-    # Build content for TXT
+    # Build TXT Content
     $txtContent = @()
     $txtContent += "===== SYSTEM INFORMATION ====="
     $txtContent += ""
@@ -122,6 +130,7 @@ if ($exportTXT -match '^(Y|y)$') {
     $txtContent += "IP Address(es): $IPAddresses"
     $txtContent += "OS Name:        $OSName"
     $txtContent += "OS Version:     $OSVersion"
+    $txtContent += "PowerShell Ver: $PSVersion"
     $txtContent += "RAM (GB):       $RAM_GB"
     $txtContent += "CPU:            $($CPU.Name)"
     $txtContent += "Cores:          $($CPU.NumberOfCores)"
@@ -130,24 +139,14 @@ if ($exportTXT -match '^(Y|y)$') {
     $txtContent += "===== FILE SYSTEM DRIVES ====="
     $txtContent += ""
 
-    foreach ($d in $Drives) {
-        $usedGB = if ($d.Used -ne $null) { [math]::Round($d.Used/1GB, 2) } else { 0 }
-        $freeGB = if ($d.Free -ne $null) { [math]::Round($d.Free/1GB, 2) } else { 0 }
-        $txtContent += "Drive $($d.Name): Root=$($d.Root) Used=${usedGB}GB Free=${freeGB}GB"
-    }
+    foreach ($d in ($driveInfo | Sort-Object Name)) {
+        $capGB  = if ($d.CapacityGB -ne $null) { $d.CapacityGB } else { 0 }
+        $usedGB = if ($d.UsedGB     -ne $null) { $d.UsedGB     } else { 0 }
+        $freeGB = if ($d.FreeGB     -ne $null) { $d.FreeGB     } else { 0 }
+        $fs     = if ($d.FileSystem) { $d.FileSystem } else { "" }
+        $label  = if ($d.VolumeName) { $d.VolumeName } else { "" }
 
-    $txtContent += ""
-    $txtContent += "===== SMB SHARES ====="
-    $txtContent += ""
-
-    if ($SMBShares -is [string]) {
-        $txtContent += $SMBShares
-    }
-    else {
-        foreach ($s in $SMBShares) {
-            $desc = if ([string]::IsNullOrWhiteSpace($s.Description)) { "" } else { $s.Description }
-            $txtContent += "Share: $($s.Name) | Path: $($s.Path) | Description: $desc | Scope: $($s.ScopeName) | State: $($s.ShareState)"
-        }
+        $txtContent += "Drive $($d.Name): Root=$($d.Root) Capacity=${capGB}GB Used=${usedGB}GB Free=${freeGB}GB FS=$fs Label=$label"
     }
 
     # Write to TXT
